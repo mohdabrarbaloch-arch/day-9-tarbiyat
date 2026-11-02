@@ -1,7 +1,8 @@
 """CSV parsing, column profiling, encoding and the train/test split.
 
-The rule here: everything the encoder learns about the data must be capturable and
-reusable. If prediction has to re-derive it, the two paths can disagree.
+The rule here is that nothing is silently guessed. Every column is profiled, encoded,
+and reported back to the user, so a model that learns nothing can be traced to a
+specific column decision rather than to mystery.
 """
 
 from __future__ import annotations
@@ -9,44 +10,49 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import math
 from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
 
-MAX_DISTINCT_CATEGORIES = 60
-NUMERIC_LIKE = 0.95  # a column is numeric if this share of values parse as floats
+ColumnKind = Literal["numeric", "categorical", "target"]
 
 
-class DatasetError(Exception):
-    """Raised for anything wrong with the user's CSV that we can explain to them."""
+class DatasetError(ValueError):
+    """Raised when a CSV cannot be safely turned into training data."""
 
 
 @dataclass
 class ColumnProfile:
-    """What we learned about one column."""
-
     name: str
-    kind: Literal["numeric", "categorical"]
-    missing: int
-    distinct: int
-    categories: list[str] = field(default_factory=list)
+    kind: ColumnKind
+    # numeric
+    mean: float | None = None
+    std: float | None = None
     minimum: float | None = None
     maximum: float | None = None
-    mean: float | None = None
+    missing: int = 0
+    # categorical
+    categories: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "name": self.name,
             "kind": self.kind,
             "missing": self.missing,
-            "distinct": self.distinct,
-            "categories": self.categories,
-            "min": self.minimum,
-            "max": self.maximum,
-            "mean": self.mean,
         }
+        if self.kind == "numeric":
+            out.update(
+                {
+                    "mean": self.mean,
+                    "std": self.std,
+                    "min": self.minimum,
+                    "max": self.maximum,
+                }
+            )
+        else:
+            out["categories"] = self.categories
+        return out
 
 
 @dataclass
@@ -57,6 +63,158 @@ class ParsedDataset:
     task: Literal["classification", "regression"]
     profiles: list[ColumnProfile]
     fingerprint: str
+
+
+def fingerprint_bytes(raw: bytes) -> str:
+    """Stable content hash so a dataset can be cited without storing its body twice."""
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _looks_numeric(values: list[str]) -> bool:
+    seen = 0
+    for v in values:
+        s = v.strip()
+        if not s:
+            continue
+        seen += 1
+        try:
+            float(s)
+        except ValueError:
+            return False
+    return seen > 0
+
+
+def parse_csv(
+    raw: bytes,
+    target: str,
+    max_rows: int,
+    max_columns: int,
+) -> ParsedDataset:
+    """Parse and profile a CSV. Raises DatasetError with an actionable message."""
+    if not raw.strip():
+        raise DatasetError("The uploaded file is empty.")
+
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise DatasetError("The file is not valid UTF-8. Re-export it as UTF-8 CSV.") from exc
+
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel  # type: ignore[assignment]
+
+    reader = csv.reader(io.StringIO(text), dialect)
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise DatasetError("The CSV has no header row.") from exc
+
+    header = [h.strip() for h in header]
+    if not header or all(not h for h in header):
+        raise DatasetError("The header row is empty.")
+
+    if len(header) < 2:
+        raise DatasetError("A dataset needs at least two columns (one feature and a target).")
+
+    if len(header) > max_columns:
+        raise DatasetError(f"Too many columns ({len(header)}). The limit is {max_columns}.")
+
+    if len(set(header)) != len(header):
+        dupes = sorted({h for h in header if header.count(h) > 1})
+        raise DatasetError(f"Duplicate column names: {', '.join(dupes)}")
+
+    if target not in header:
+        raise DatasetError(
+            f"Target column '{target}' is not in the file. Available: {', '.join(header)}"
+        )
+
+    rows: list[list[str]] = []
+    for row in reader:
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if len(row) != len(header):
+            raise DatasetError(
+                f"Row {len(rows) + 2} has {len(row)} fields but the header has {len(header)}."
+            )
+        rows.append([cell.strip() for cell in row])
+        if len(rows) > max_rows:
+            raise DatasetError(
+                f"Too many rows. The limit is {max_rows:,} for interactive training."
+            )
+
+    if len(rows) < 10:
+        raise DatasetError(
+            f"Only {len(rows)} usable rows. At least 10 are needed to split and train."
+        )
+
+    target_index = header.index(target)
+    target_values = [r[target_index] for r in rows]
+    target_numeric = _looks_numeric(target_values)
+
+    if target_numeric:
+        uniques = len({v for v in target_values if v})
+        # Low-cardinality integers are classes, not a regression target.
+        task: Literal["classification", "regression"] = (
+            "classification" if uniques <= 10 else "regression"
+        )
+    else:
+        task = "classification"
+        uniques = len({v for v in target_values if v})
+        if uniques > 50:
+            raise DatasetError(
+                f"The target has {uniques} distinct values. Classification targets are "
+                "capped at 50 classes."
+            )
+        if uniques < 2:
+            raise DatasetError("The target column has only one distinct value.")
+
+    profiles: list[ColumnProfile] = []
+    for index, name in enumerate(header):
+        values = [r[index] for r in rows]
+        missing = sum(1 for v in values if not v)
+        present = [v for v in values if v]
+
+        if name == target:
+            kind: ColumnKind = "target"
+        elif _looks_numeric(present):
+            kind = "numeric"
+        else:
+            kind = "categorical"
+
+        profile = ColumnProfile(name=name, kind=kind, missing=missing)
+
+        if kind == "numeric":
+            floats = np.array([float(v) for v in present], dtype=np.float64)
+            profile.mean = float(floats.mean()) if floats.size else None
+            profile.std = float(floats.std()) if floats.size else None
+            profile.minimum = float(floats.min()) if floats.size else None
+            profile.maximum = float(floats.max()) if floats.size else None
+        elif kind == "categorical":
+            cats = sorted(set(present))
+            if len(cats) > 60:
+                raise DatasetError(
+                    f"Column '{name}' has {len(cats)} categories, which would explode the "
+                    "input width. Encode it numerically or drop it before uploading."
+                )
+            profile.categories = cats
+
+        profiles.append(profile)
+
+    feature_columns = [p for p in profiles if p.name != target]
+    if not feature_columns:
+        raise DatasetError("There are no feature columns left after removing the target.")
+    if all(p.kind == "categorical" and len(p.categories) < 2 for p in feature_columns):
+        raise DatasetError("Every feature column is constant; there is nothing to learn.")
+
+    return ParsedDataset(
+        columns=header,
+        rows=rows,
+        target=target,
+        task=task,
+        profiles=profiles,
+        fingerprint=fingerprint_bytes(raw),
+    )
 
 
 @dataclass
@@ -119,198 +277,40 @@ class EncodedDataset:
     spec: EncodingSpec | None = None
 
 
-def _looks_numeric(values: list[str]) -> bool:
-    present = [v for v in values if v != ""]
-    if not present:
-        return False
-    ok = 0
-    for v in present:
-        try:
-            float(v)
-            ok += 1
-        except ValueError:
-            continue
-    return ok / len(present) >= NUMERIC_LIKE
-
-
-def parse_csv(
-    raw: bytes,
-    target: str,
-    max_rows: int = 20_000,
-    max_columns: int = 60,
-) -> ParsedDataset:
-    """Read a CSV, profile every column, and decide whether the target is a class or a number."""
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise DatasetError("The file is not valid UTF-8. Save it as UTF-8 CSV and retry.") from exc
-
-    try:
-        reader = csv.reader(io.StringIO(text))
-        all_rows = [row for row in reader if any(cell.strip() for cell in row)]
-    except csv.Error as exc:
-        raise DatasetError(f"Could not parse the CSV: {exc}") from exc
-
-    if len(all_rows) < 2:
-        raise DatasetError("The CSV needs a header row and at least one data row.")
-
-    header = [h.strip() for h in all_rows[0]]
-    body = all_rows[1:]
-
-    if len(header) > max_columns:
-        raise DatasetError(f"That CSV has {len(header)} columns; the limit is {max_columns}.")
-    if len(header) != len(set(header)):
-        raise DatasetError("Column names must be unique; this CSV repeats one.")
-    if not target:
-        raise DatasetError("Choose a target column to predict.")
-    if target not in header:
-        raise DatasetError(
-            f"Target column {target!r} is not in the file. Columns are: {', '.join(header)}"
-        )
-
-    if len(body) > max_rows:
-        body = body[:max_rows]
-
-    width = len(header)
-    body = [row + [""] * (width - len(row)) if len(row) < width else row[:width] for row in body]
-    body = [row for row in body if any(cell.strip() for cell in row)]
-    if not body:
-        raise DatasetError("Every data row was blank.")
-    if len(body) < 10:
-        raise DatasetError(
-            f"Only {len(body)} data rows. Training needs at least 10 so the test split means something."
-        )
-
-    target_index = header.index(target)
-    target_values = [row[target_index].strip() for row in body]
-    target_present = [v for v in target_values if v]
-    if len(target_present) < len(target_values):
-        raise DatasetError(
-            f"The target column {target!r} has {len(target_values) - len(target_present)} empty "
-            "cells. Fill or drop those rows first."
-        )
-
-    # Classification vs regression: numeric-looking targets with many distinct values are
-    # treated as continuous. A discrete target with few levels (even if numeric, like 0/1)
-    # is a class label.
-    distinct_targets = set(target_present)
-    if _looks_numeric(target_present) and len(distinct_targets) > max(20, len(body) // 20):
-        task: Literal["classification", "regression"] = "regression"
-    else:
-        task = "classification"
-        if len(distinct_targets) < 2:
-            raise DatasetError(
-                f"The target column {target!r} has only one distinct value, so there is nothing to learn."
-            )
-        if len(distinct_targets) > 50:
-            raise DatasetError(
-                f"The target column {target!r} has {len(distinct_targets)} distinct values. "
-                "For a class label that is too many — is this actually a number?"
-            )
-
-    profiles: list[ColumnProfile] = []
-    for col_index, name in enumerate(header):
-        values = [row[col_index].strip() for row in body]
-        missing = sum(1 for v in values if v == "")
-        present = [v for v in values if v != ""]
-        numeric = _looks_numeric(present)
-
-        if numeric:
-            numbers = [float(v) for v in present if _is_float(v)]
-            profiles.append(
-                ColumnProfile(
-                    name=name,
-                    kind="numeric",
-                    missing=missing,
-                    distinct=len(set(present)),
-                    minimum=min(numbers) if numbers else None,
-                    maximum=max(numbers) if numbers else None,
-                    mean=float(np.mean(numbers)) if numbers else None,
-                )
-            )
-        else:
-            categories = sorted(set(present))
-            if len(categories) > MAX_DISTINCT_CATEGORIES:
-                raise DatasetError(
-                    f"Column {name!r} has {len(categories)} distinct text values. "
-                    "That is an id or free text, not a feature — drop it or bin it."
-                )
-            profiles.append(
-                ColumnProfile(
-                    name=name,
-                    kind="categorical",
-                    missing=missing,
-                    distinct=len(categories),
-                    categories=categories,
-                )
-            )
-
-    feature_profiles = [p for p in profiles if p.name != target]
-    if not feature_profiles:
-        raise DatasetError("After removing the target there are no feature columns left.")
-
-    fingerprint = hashlib.sha256(raw).hexdigest()[:16]
-    return ParsedDataset(
-        columns=header,
-        rows=body,
-        target=target,
-        task=task,
-        profiles=profiles,
-        fingerprint=fingerprint,
-    )
-
-
-def _is_float(value: str) -> bool:
-    try:
-        float(value)
-        return True
-    except ValueError:
-        return False
-
-
 def encode(parsed: ParsedDataset, standardize: bool = True) -> EncodedDataset:
-    """Turn rows into a numeric matrix, and record exactly how it did it."""
-    feature_profiles = [p for p in parsed.profiles if p.name != parsed.target]
-    feature_indices = [parsed.columns.index(p.name) for p in feature_profiles]
+    """One-hot encode categoricals and z-score numeric features."""
     target_index = parsed.columns.index(parsed.target)
+    feature_profiles = [p for p in parsed.profiles if p.name != parsed.target]
 
     feature_names: list[str] = []
     for profile in feature_profiles:
         if profile.kind == "numeric":
             feature_names.append(profile.name)
         else:
-            feature_names.extend(f"{profile.name}={value}" for value in profile.categories)
+            feature_names.extend(f"{profile.name}={cat}" for cat in profile.categories)
 
     n = len(parsed.rows)
     x = np.zeros((n, len(feature_names)), dtype=np.float64)
+
+    column_cursor = 0
     numeric_positions: list[int] = []
 
-    position = 0
-    for profile, col_index in zip(feature_profiles, feature_indices, strict=True):
+    for profile in feature_profiles:
+        source_index = parsed.columns.index(profile.name)
         if profile.kind == "numeric":
-            numeric_positions.append(position)
+            numeric_positions.append(column_cursor)
             for row_i, row in enumerate(parsed.rows):
-                raw = row[col_index].strip()
-                x[row_i, position] = float(raw) if _is_float(raw) else 0.0
-                if not _is_float(raw):
-                    x[row_i, position] = math.nan
-            position += 1
+                raw = row[source_index]
+                if raw:
+                    x[row_i, column_cursor] = float(raw)
+            column_cursor += 1
         else:
-            lookup = {value: i for i, value in enumerate(profile.categories)}
+            cat_to_pos = {cat: column_cursor + i for i, cat in enumerate(profile.categories)}
             for row_i, row in enumerate(parsed.rows):
-                offset = lookup.get(row[col_index].strip())
-                if offset is not None:
-                    x[row_i, position + offset] = 1.0
-            position += len(profile.categories)
-
-    # Missing numerics become the column mean, which is the least surprising imputation.
-    for pos in numeric_positions:
-        col = x[:, pos]
-        nans = np.isnan(col)
-        if nans.any():
-            fill = float(np.nanmean(col)) if (~nans).any() else 0.0
-            col[nans] = fill
-            x[:, pos] = col
+                pos = cat_to_pos.get(row[source_index])
+                if pos is not None:
+                    x[row_i, pos] = 1.0
+            column_cursor += len(profile.categories)
 
     if standardize:
         numeric_stats: dict[str, tuple[float, float]] = {}
@@ -353,7 +353,10 @@ def encode(parsed: ParsedDataset, standardize: bool = True) -> EncodedDataset:
             spec=spec,
         )
 
-    raw_target = np.array([float(v) for v in target_values], dtype=np.float64)
+    raw_target = np.array([float(v) if v else np.nan for v in target_values], dtype=np.float64)
+    if np.isnan(raw_target).any():
+        fill = float(np.nanmean(raw_target))
+        raw_target = np.where(np.isnan(raw_target), fill, raw_target)
     mean = float(raw_target.mean())
     std = float(raw_target.std()) or 1.0
     y = ((raw_target - mean) / std).reshape(-1, 1)
@@ -381,7 +384,10 @@ def encode(parsed: ParsedDataset, standardize: bool = True) -> EncodedDataset:
     )
 
 
-def encode_rows(rows: list[dict[str, float | str]], spec: EncodingSpec) -> np.ndarray:
+def encode_rows(
+    rows: list[dict[str, float | str]],
+    spec: EncodingSpec,
+) -> np.ndarray:
     """Encode new rows using the exact encoding the model was trained with.
 
     Numeric columns use the training mean and standard deviation, not the new batch's.
@@ -410,65 +416,69 @@ def encode_rows(rows: list[dict[str, float | str]], spec: EncodingSpec) -> np.nd
 
 
 def stratified_split(
-    x: np.ndarray, y: np.ndarray, test_fraction: float, rng: np.random.Generator
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split while keeping the class balance of the train set and the test set similar.
+    y: np.ndarray,
+    test_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (train_idx, test_idx), stratified for classification one-hot targets."""
+    n = y.shape[0]
+    if not 0.05 <= test_fraction <= 0.5:
+        raise ValueError("test_fraction must be between 0.05 and 0.5")
 
-    A plain shuffle can drop a rare class out of the test set entirely, which makes the
-    reported score meaningless. Stratifying per class avoids that.
-    """
-    n = x.shape[0]
-    if y.ndim == 1 or y.shape[1] == 1:
-        # Regression: a plain shuffle is fine.
+    if y.shape[1] == 1:
         order = rng.permutation(n)
-        cut = max(1, min(int(round(n * (1 - test_fraction))), n - 1))
-        return x[order[:cut]], y[order[:cut]], x[order[cut:]], y[order[cut:]]
+        cut = max(1, int(round(n * (1 - test_fraction))))
+        cut = min(cut, n - 1)
+        return np.sort(order[:cut]), np.sort(order[cut:])
 
     labels = np.argmax(y, axis=1)
-    train_idx: list[int] = []
-    test_idx: list[int] = []
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+
     for label in np.unique(labels):
-        members = np.flatnonzero(labels == label)
-        rng.shuffle(members)
-        n_test = max(1, int(round(len(members) * test_fraction))) if len(members) > 1 else 0
-        test_idx.extend(members[:n_test].tolist())
-        train_idx.extend(members[n_test:].tolist())
+        idx = np.where(labels == label)[0]
+        rng.shuffle(idx)
+        if idx.size < 2:
+            # A class with one member cannot be split; keep it in train.
+            train_parts.append(idx)
+            continue
+        n_test = max(1, int(round(idx.size * test_fraction)))
+        n_test = min(n_test, idx.size - 1)
+        test_parts.append(idx[:n_test])
+        train_parts.append(idx[n_test:])
 
-    if not train_idx or not test_idx:
-        raise DatasetError("The dataset is too small or too imbalanced to split into train and test.")
-
-    tr = np.array(sorted(train_idx))
-    te = np.array(sorted(test_idx))
-    return x[tr], y[tr], x[te], y[te]
+    train_idx = np.sort(np.concatenate(train_parts)) if train_parts else np.array([], dtype=int)
+    test_idx = np.sort(np.concatenate(test_parts)) if test_parts else np.array([], dtype=int)
+    return train_idx, test_idx
 
 
-def confusion_matrix(true_idx: np.ndarray, pred_idx: np.ndarray, n_classes: int) -> list[list[int]]:
-    """Rows are the truth, columns are what the model said."""
+def confusion_matrix(pred: np.ndarray, truth: np.ndarray, n_classes: int) -> list[list[int]]:
+    """Plain integer confusion matrix, rows = truth, columns = predicted."""
     matrix = [[0] * n_classes for _ in range(n_classes)]
-    for t, p in zip(true_idx.tolist(), pred_idx.tolist(), strict=True):
-        matrix[t][p] += 1
+    for p, t in zip(pred, truth, strict=True):
+        matrix[int(t)][int(p)] += 1
     return matrix
 
 
 def per_class_metrics(
-    true_idx: np.ndarray, pred_idx: np.ndarray, labels: list[str]
-) -> dict[str, dict[str, float]]:
-    """Precision/recall/F1 for each class, computed from the confusion counts directly."""
-    n = len(labels)
-    matrix = confusion_matrix(true_idx, pred_idx, n)
-    out: dict[str, dict[str, float]] = {}
-
-    for i, label in enumerate(labels):
-        tp = matrix[i][i]
-        fp = sum(matrix[r][i] for r in range(n)) - tp
-        fn = sum(matrix[i][c] for c in range(n)) - tp
+    pred: np.ndarray, truth: np.ndarray, labels: list[str]
+) -> list[dict[str, float | str]]:
+    """Precision, recall and F1 per class, computed without sklearn."""
+    out: list[dict[str, float | str]] = []
+    for index, label in enumerate(labels):
+        tp = int(np.sum((pred == index) & (truth == index)))
+        fp = int(np.sum((pred == index) & (truth != index)))
+        fn = int(np.sum((pred != index) & (truth == index)))
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-        out[label] = {
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "f1": round(f1, 4),
-            "support": float(sum(matrix[i])),
-        }
+        out.append(
+            {
+                "label": label,
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+                "support": float(tp + fn),
+            }
+        )
     return out
