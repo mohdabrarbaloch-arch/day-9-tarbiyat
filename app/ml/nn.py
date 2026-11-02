@@ -1,85 +1,86 @@
 """A from-scratch multilayer perceptron with analytic backpropagation.
 
-This is the whole point of the project: no PyTorch, no TensorFlow, no autograd. The
-forward pass, the gradients and the optimizers are written out longhand in NumPy.
+This is deliberately dependency-light: numpy plus a lot of noisy arithmetic. The point
+of the project is that when the loss curve bends, something real happened — there is no
+framework doing the work behind a curtain.
 
-Design decision worth calling out: the output layer fuses its loss with its gradient, so
-the delta it hands back is dL/dz (pre-activation), not dL/da (post-activation). Getting
-that wrong is invisible in the common softmax+cross-entropy case, because the softmax
-Jacobian and the CE derivative cancel to exactly `p - y` either way — which is precisely
-why the bug survives casual testing and shows up only as "MSE never converges" or
-"sigmoid regression is weirdly bad".
+Everything is float64 so the numbers in the UI match the numbers in the tests.
+
+A note on the output layer, because it is the easiest thing to get quietly wrong: the
+backward pass needs the gradient with respect to the PRE-activation (z), not the
+softmax/sigmoid probability. For softmax+CCE and sigmoid+BCE the activation derivative
+cancels and the answer is just (p - y)/N. For MSE it does not, and for softmax+MSE you
+need the full Jacobian. All of that is fused in `output_loss_and_delta` below, and
+`scripts/gradcheck.py` proves it against finite differences before anything trusts it.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
 
 Activation = Literal["relu", "tanh", "sigmoid"]
-Optimizer = Literal["sgd", "momentum", "adam"]
 Init = Literal["he", "xavier", "normal"]
-LossName = Literal["cce", "bce", "mse"]
+OptimizerName = Literal["sgd", "momentum", "adam"]
+LossName = Literal["mse", "bce", "cce"]
 
 
-@dataclass
-class TrainConfig:
-    hidden_layers: list[int] = field(default_factory=lambda: [16])
-    activation: Activation = "relu"
-    init: Init = "he"
-    learning_rate: float = 0.05
-    epochs: int = 120
-    batch_size: int = 16
-    l2: float = 0.0
-    momentum: float = 0.9
-    beta1: float = 0.9
-    beta2: float = 0.999
-    epsilon: float = 1e-8
-    early_stopping: bool = False
-    patience: int = 12
-    seed: int = 42
+# --------------------------------------------------------------------------------------
+# Activations
+# --------------------------------------------------------------------------------------
 
 
-@dataclass
-class EpochStats:
-    epoch: int
-    train_loss: float
-    train_accuracy: float | None = None
-    val_loss: float | None = None
-    val_accuracy: float | None = None
+def _relu(z: np.ndarray) -> np.ndarray:
+    return np.maximum(z, 0.0)
 
 
-@dataclass
-class TrainResult:
-    weights: list[np.ndarray]
-    biases: list[np.ndarray]
-    history: list[EpochStats]
-    stopped_early: bool
-    best_epoch: int
+def _relu_grad(z: np.ndarray) -> np.ndarray:
+    return (z > 0.0).astype(np.float64)
+
+
+def _tanh(z: np.ndarray) -> np.ndarray:
+    return np.tanh(z)
+
+
+def _tanh_grad(z: np.ndarray) -> np.ndarray:
+    return 1.0 - np.tanh(z) ** 2
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
-    """Numerically stable logistic function (no overflow for large |z|)."""
-    out = np.empty_like(z, dtype=np.float64)
-    positive = z >= 0
-    out[positive] = 1.0 / (1.0 + np.exp(-z[positive]))
-    exp_z = np.exp(z[~positive])
-    out[~positive] = exp_z / (1.0 + exp_z)
+    # Split by sign so exp() never overflows on large negative inputs.
+    out = np.empty_like(z)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    exp_z = np.exp(z[~pos])
+    out[~pos] = exp_z / (1.0 + exp_z)
     return out
 
 
+def _sigmoid_grad(z: np.ndarray) -> np.ndarray:
+    s = _sigmoid(z)
+    return s * (1.0 - s)
+
+
+_FORWARD = {"relu": _relu, "tanh": _tanh, "sigmoid": _sigmoid}
+_BACKWARD = {"relu": _relu_grad, "tanh": _tanh_grad, "sigmoid": _sigmoid_grad}
+
+
 def softmax(z: np.ndarray) -> np.ndarray:
-    """Row-wise softmax, shifted by the row max so exp() cannot overflow."""
+    """Numerically stable softmax over the last axis."""
     shifted = z - np.max(z, axis=1, keepdims=True)
     exp = np.exp(shifted)
     return exp / np.sum(exp, axis=1, keepdims=True)
 
 
-def output_probabilities(
-    z: np.ndarray, output_dim: int, *, linear: bool = False
-) -> np.ndarray:
+# --------------------------------------------------------------------------------------
+# Fused output activation + loss, returning the delta w.r.t. z
+# --------------------------------------------------------------------------------------
+
+
+def output_probabilities(z: np.ndarray, output_dim: int, *, linear: bool = False) -> np.ndarray:
     """Softmax for multi-class heads, sigmoid for a single binary output, identity for regression.
 
     `linear` matters more than it looks. A regression target is z-scored, so roughly a
@@ -93,6 +94,19 @@ def output_probabilities(
     if output_dim > 1:
         return softmax(z)
     return _sigmoid(z)
+
+
+def validate_loss_for_output(loss: LossName, output_dim: int) -> None:
+    """Reject combinations whose gradient we do not implement."""
+    if loss == "cce" and output_dim == 1:
+        raise ValueError("cce needs at least two output units; use bce for a single output")
+    if loss == "bce" and output_dim > 1:
+        raise ValueError(
+            "bce with multiple outputs would need independent sigmoids, which this model "
+            "does not implement; use cce for a multi-class head"
+        )
+    if loss not in {"mse", "bce", "cce"}:
+        raise ValueError(f"Unknown loss: {loss}")
 
 
 def output_loss_and_delta(
@@ -138,8 +152,89 @@ def output_loss_and_delta(
     return loss, p, delta
 
 
+# --------------------------------------------------------------------------------------
+# Configuration and results
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class TrainConfig:
+    """Everything the user can turn. Validated by the caller before it reaches here."""
+
+    hidden_layers: list[int] = field(default_factory=lambda: [16])
+    activation: Activation = "relu"
+    init: Init = "he"
+    optimizer: OptimizerName = "adam"
+    learning_rate: float = 0.05
+    epochs: int = 120
+    batch_size: int = 16
+    l2: float = 0.0
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        if not self.hidden_layers:
+            raise ValueError("At least one hidden layer is required")
+        if any(width < 1 for width in self.hidden_layers):
+            raise ValueError("Hidden layer widths must be >= 1")
+        if self.epochs < 1:
+            raise ValueError("epochs must be >= 1")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0")
+        if self.l2 < 0:
+            raise ValueError("l2 must be >= 0")
+        if self.activation not in _FORWARD:
+            raise ValueError(f"Unknown activation: {self.activation}")
+        if self.optimizer not in {"sgd", "momentum", "adam"}:
+            raise ValueError(f"Unknown optimizer: {self.optimizer}")
+        if self.init not in {"he", "xavier", "normal"}:
+            raise ValueError(f"Unknown init: {self.init}")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "hidden_layers": list(self.hidden_layers),
+            "activation": self.activation,
+            "init": self.init,
+            "optimizer": self.optimizer,
+            "learning_rate": self.learning_rate,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "l2": self.l2,
+            "seed": self.seed,
+        }
+
+
+@dataclass
+class EpochMetrics:
+    epoch: int
+    train_loss: float
+    train_accuracy: float
+    val_loss: float | None
+    val_accuracy: float | None
+
+
+@dataclass
+class TrainingResult:
+    history: list[EpochMetrics]
+    weights: list[np.ndarray]
+    biases: list[np.ndarray]
+    input_dim: int
+    output_dim: int
+    config: TrainConfig
+    final_train_loss: float
+    final_val_loss: float | None
+    best_epoch: int
+    stopped_early: bool
+
+
+# --------------------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------------------
+
+
 class MLP:
-    """A fully-connected network with a configurable depth."""
+    """A plain multilayer perceptron. One hidden activation, softmax/sigmoid/mse head."""
 
     def __init__(
         self,
@@ -158,103 +253,154 @@ class MLP:
         self.config = config
         self.rng = rng
 
-        dims = [input_dim, *config.hidden_layers, output_dim]
+        sizes = [input_dim, *config.hidden_layers, output_dim]
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
 
-        for layer, (fan_in, fan_out) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
-            is_output = layer == len(dims) - 2
-            if config.init == "he":
-                scale = np.sqrt(2.0 / fan_in)
-            elif config.init == "xavier":
-                scale = np.sqrt(1.0 / fan_in)
-            else:
-                scale = 0.05
-            self.weights.append(rng.normal(0.0, scale, size=(fan_in, fan_out)))
+        for i in range(len(sizes) - 1):
+            fan_in, fan_out = sizes[i], sizes[i + 1]
+            self.weights.append(self._init_matrix(fan_in, fan_out))
             self.biases.append(np.zeros((1, fan_out), dtype=np.float64))
-            if is_output and self.linear_head:
-                # Start a regression head near zero so the initial prediction is the mean.
-                self.weights[-1][:] *= 0.1
 
-    @property
-    def param_count(self) -> int:
-        return sum(w.size for w in self.weights) + sum(b.size for b in self.biases)
+        # Optimizer state, one entry per layer.
+        self._m_w = [np.zeros_like(w) for w in self.weights]
+        self._v_w = [np.zeros_like(w) for w in self.weights]
+        self._m_b = [np.zeros_like(b) for b in self.biases]
+        self._v_b = [np.zeros_like(b) for b in self.biases]
+        self._t = 0
 
-    def _activate(self, z: np.ndarray) -> np.ndarray:
-        if self.config.activation == "relu":
-            return np.maximum(0.0, z)
-        if self.config.activation == "tanh":
-            return np.tanh(z)
-        return _sigmoid(z)
-
-    def _activation_grad(self, z: np.ndarray, a: np.ndarray) -> np.ndarray:
-        if self.config.activation == "relu":
-            return (z > 0).astype(np.float64)
-        if self.config.activation == "tanh":
-            return 1.0 - a**2
-        return a * (1.0 - a)
+    def _init_matrix(self, fan_in: int, fan_out: int) -> np.ndarray:
+        if self.config.init == "he":
+            scale = math.sqrt(2.0 / fan_in)
+        elif self.config.init == "xavier":
+            scale = math.sqrt(1.0 / fan_in)
+        else:
+            scale = 0.05
+        return self.rng.normal(0.0, scale, size=(fan_in, fan_out))
 
     def _forward(self, x: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        """Return (pre-activations, activations). The last activation is the raw output z."""
+        """Return (pre-activations, activations). activations[0] is the input."""
+        act = _FORWARD[self.config.activation]
         zs: list[np.ndarray] = []
-        activations: list[np.ndarray] = [x]
+        acts: list[np.ndarray] = [x]
+
         current = x
         last = len(self.weights) - 1
         for i, (w, b) in enumerate(zip(self.weights, self.biases, strict=True)):
             z = current @ w + b
             zs.append(z)
-            current = z if i == last else self._activate(z)
-            activations.append(current)
-        return zs, activations
+            current = z if i == last else act(z)
+            acts.append(current)
+        return zs, acts
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
         zs, _ = self._forward(x)
         return output_probabilities(zs[-1], self.output_dim, linear=self.linear_head)
 
     def predict(self, x: np.ndarray) -> np.ndarray:
-        return self.predict_proba(x)
+        proba = self.predict_proba(x)
+        if self.output_dim > 1:
+            return np.argmax(proba, axis=1)
+        return (proba[:, 0] >= 0.5).astype(np.int64)
 
-    def backward(self, x: np.ndarray, delta_out: np.ndarray) -> tuple[list, list]:
-        """Backprop from the output delta. Returns (weight grads, bias grads)."""
-        zs, activations = self._forward(x)
-        weight_grads: list[np.ndarray] = [np.zeros_like(w) for w in self.weights]
-        bias_grads: list[np.ndarray] = [np.zeros_like(b) for b in self.biases]
+    def param_count(self) -> int:
+        return int(sum(w.size for w in self.weights) + sum(b.size for b in self.biases))
 
-        delta = delta_out
-        for layer in range(len(self.weights) - 1, -1, -1):
-            weight_grads[layer] = activations[layer].T @ delta
-            bias_grads[layer] = np.sum(delta, axis=0, keepdims=True)
-            if layer > 0:
-                delta = (delta @ self.weights[layer].T) * self._activation_grad(
-                    zs[layer - 1], activations[layer]
-                )
-        return weight_grads, bias_grads
 
-    def loss(self, x: np.ndarray, y: np.ndarray, loss_name: LossName) -> float:
-        zs, _ = self._forward(x)
-        value, _, _ = output_loss_and_delta(
-            loss_name, zs[-1], y, self.output_dim, linear=self.linear_head
-        )
-        return value
+# --------------------------------------------------------------------------------------
+# Trainer
+# --------------------------------------------------------------------------------------
 
 
 class Trainer:
-    """Mini-batch gradient descent with a choice of optimizer."""
+    """Owns the optimisation loop so `MLP` stays a pure model."""
 
     def __init__(self, model: MLP, loss: LossName, rng: np.random.Generator) -> None:
+        validate_loss_for_output(loss, model.output_dim)
         self.model = model
         self.loss_name: LossName = loss
         self.rng = rng
 
     def _loss(self, x: np.ndarray, y: np.ndarray) -> tuple[float, np.ndarray]:
-        zs, _ = self._forward_cached(x)
-        loss, _, delta = output_loss_and_delta(
+        zs, _ = self.model._forward(x)
+        loss, proba, _ = output_loss_and_delta(
             self.loss_name, zs[-1], y, self.model.output_dim, linear=self.model.linear_head
         )
-        return loss, delta
+        return loss, proba
 
-    def _forward_cached(self, x: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        return self.model._forward(x)
+    def _backward(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        zs: list[np.ndarray],
+        acts: list[np.ndarray],
+    ) -> tuple[float, list[np.ndarray], list[np.ndarray]]:
+        """One backward pass. Returns loss and per-layer gradients."""
+        model = self.model
+        loss, _, delta = output_loss_and_delta(
+            self.loss_name, zs[-1], y, model.output_dim, linear=model.linear_head
+        )
+
+        grad_w: list[np.ndarray] = [np.zeros_like(w) for w in model.weights]
+        grad_b: list[np.ndarray] = [np.zeros_like(b) for b in model.biases]
+        act_grad = _BACKWARD[model.config.activation]
+
+        for layer in range(len(model.weights) - 1, -1, -1):
+            grad_w[layer] = acts[layer].T @ delta
+            grad_b[layer] = np.sum(delta, axis=0, keepdims=True)
+            if layer > 0:
+                delta = (delta @ model.weights[layer].T) * act_grad(zs[layer - 1])
+
+        return loss, grad_w, grad_b
+
+    def _step(self, grad_w: list[np.ndarray], grad_b: list[np.ndarray]) -> None:
+        model = self.model
+        cfg = model.config
+        model._t += 1
+        t = model._t
+        lr = cfg.learning_rate
+
+        for i in range(len(model.weights)):
+            gw = grad_w[i] + cfg.l2 * model.weights[i]
+            gb = grad_b[i]
+
+            if cfg.optimizer == "sgd":
+                model.weights[i] -= lr * gw
+                model.biases[i] -= lr * gb
+                continue
+
+            if cfg.optimizer == "momentum":
+                beta = 0.9
+                model._m_w[i] = beta * model._m_w[i] + gw
+                model._m_b[i] = beta * model._m_b[i] + gb
+                model.weights[i] -= lr * model._m_w[i]
+                model.biases[i] -= lr * model._m_b[i]
+                continue
+
+            # Adam
+            b1, b2, eps = 0.9, 0.999, 1e-8
+            model._m_w[i] = b1 * model._m_w[i] + (1 - b1) * gw
+            model._v_w[i] = b2 * model._v_w[i] + (1 - b2) * (gw**2)
+            model._m_b[i] = b1 * model._m_b[i] + (1 - b1) * gb
+            model._v_b[i] = b2 * model._v_b[i] + (1 - b2) * (gb**2)
+
+            m_hat_w = model._m_w[i] / (1 - b1**t)
+            v_hat_w = model._v_w[i] / (1 - b2**t)
+            m_hat_b = model._m_b[i] / (1 - b1**t)
+            v_hat_b = model._v_b[i] / (1 - b2**t)
+
+            model.weights[i] -= lr * m_hat_w / (np.sqrt(v_hat_w) + eps)
+            model.biases[i] -= lr * m_hat_b / (np.sqrt(v_hat_b) + eps)
+
+    def _accuracy(self, x: np.ndarray, y: np.ndarray) -> float:
+        if x.shape[0] == 0:
+            return 0.0
+        pred = self.model.predict(x)
+        if self.model.output_dim > 1:
+            truth = np.argmax(y, axis=1)
+        else:
+            truth = (y[:, 0] >= 0.5).astype(np.int64)
+        return float(np.mean(pred == truth))
 
     def fit(
         self,
@@ -262,168 +408,83 @@ class Trainer:
         y_train: np.ndarray,
         x_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
-    ) -> TrainResult:
+        patience: int | None = None,
+        min_delta: float = 1e-5,
+    ) -> TrainingResult:
+        """Train in mini-batches. Optional early stopping on validation loss."""
         cfg = self.model.config
         n = x_train.shape[0]
-        batch_size = max(1, min(cfg.batch_size, n))
+        history: list[EpochMetrics] = []
 
-        velocities = [np.zeros_like(w) for w in self.model.weights]
-        velocity_b = [np.zeros_like(b) for b in self.model.biases]
-        m_w = [np.zeros_like(w) for w in self.model.weights]
-        v_w = [np.zeros_like(w) for w in self.model.weights]
-        m_b = [np.zeros_like(b) for b in self.model.biases]
-        v_b = [np.zeros_like(b) for b in self.model.biases]
-
-        history: list[EpochStats] = []
-        best_val = float("inf")
+        best_val = math.inf
         best_epoch = 0
-        best_weights = [w.copy() for w in self.model.weights]
-        best_biases = [b.copy() for b in self.model.biases]
+        best_w = [w.copy() for w in self.model.weights]
+        best_b = [b.copy() for b in self.model.biases]
         stale = 0
         stopped_early = False
-        step = 0
 
         for epoch in range(1, cfg.epochs + 1):
             order = self.rng.permutation(n)
-            x_shuffled = x_train[order]
-            y_shuffled = y_train[order]
+            epoch_losses: list[float] = []
 
-            for start in range(0, n, batch_size):
-                xb = x_shuffled[start : start + batch_size]
-                yb = y_shuffled[start : start + batch_size]
-                if xb.shape[0] == 0:
-                    continue
-                _, delta = self._loss(xb, yb)
-                weight_grads, bias_grads = self.model.backward(xb, delta)
-                step += 1
-                self._apply(weight_grads, bias_grads, velocities, velocity_b,
-                            m_w, v_w, m_b, v_b, step)
+            for start in range(0, n, cfg.batch_size):
+                idx = order[start : start + cfg.batch_size]
+                xb, yb = x_train[idx], y_train[idx]
+                zs, acts = self.model._forward(xb)
+                loss, gw, gb = self._backward(xb, yb, zs, acts)
+                self._step(gw, gb)
+                epoch_losses.append(loss)
 
-            train_loss = self.model.loss(x_train, y_train, self.loss_name)
-            stats = EpochStats(
-                epoch=epoch,
-                train_loss=round(float(train_loss), 6),
-                train_accuracy=(
-                    round(float(self._accuracy(x_train, y_train)), 4)
-                    if self.model.output_dim > 1 or self.loss_name != "mse"
-                    else None
-                ),
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            train_acc = self._accuracy(x_train, y_train)
+
+            val_loss = val_acc = None
+            if x_val is not None and y_val is not None and x_val.shape[0] > 0:
+                val_loss, _ = self._loss(x_val, y_val)
+                val_acc = self._accuracy(x_val, y_val)
+
+            history.append(
+                EpochMetrics(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    train_accuracy=train_acc,
+                    val_loss=val_loss,
+                    val_accuracy=val_acc,
+                )
             )
 
-            if x_val is not None and y_val is not None and y_val.shape[0]:
-                val_loss = self.model.loss(x_val, y_val, self.loss_name)
-                stats.val_loss = round(float(val_loss), 6)
-                stats.val_accuracy = (
-                    round(float(self._accuracy(x_val, y_val)), 4)
-                    if self.model.output_dim > 1 or self.loss_name != "mse"
-                    else None
-                )
-
-                if val_loss < best_val - 1e-6:
-                    best_val = float(val_loss)
+            if val_loss is not None and patience is not None:
+                if val_loss < best_val - min_delta:
+                    best_val = val_loss
                     best_epoch = epoch
+                    best_w = [w.copy() for w in self.model.weights]
+                    best_b = [b.copy() for b in self.model.biases]
                     stale = 0
-                    best_weights = [w.copy() for w in self.model.weights]
-                    best_biases = [b.copy() for b in self.model.biases]
                 else:
                     stale += 1
-                    if cfg.early_stopping and stale >= cfg.patience:
+                    if stale >= patience:
                         stopped_early = True
-                        history.append(stats)
                         break
 
-            history.append(stats)
+        # Restore the best weights if early stopping was armed; otherwise keep the last.
+        if patience is not None and best_epoch > 0:
+            self.model.weights = best_w
+            self.model.biases = best_b
+        else:
+            best_epoch = len(history)
 
-        if best_epoch > 0:
-            self.model.weights = best_weights
-            self.model.biases = best_biases
+        final_train = history[-1].train_loss if history else 0.0
+        final_val = history[-1].val_loss if history else None
 
-        return TrainResult(
+        return TrainingResult(
+            history=history,
             weights=self.model.weights,
             biases=self.model.biases,
-            history=history,
+            input_dim=self.model.input_dim,
+            output_dim=self.model.output_dim,
+            config=cfg,
+            final_train_loss=final_train,
+            final_val_loss=final_val,
+            best_epoch=best_epoch,
             stopped_early=stopped_early,
-            best_epoch=best_epoch or len(history),
-        )
-
-    def _accuracy(self, x: np.ndarray, y: np.ndarray) -> float:
-        proba = self.model.predict_proba(x)
-        if self.model.output_dim > 1:
-            preds = np.argmax(proba, axis=1)
-            truth = np.argmax(y, axis=1)
-        else:
-            preds = (proba[:, 0] >= 0.5).astype(int)
-            truth = (y[:, 0] >= 0.5).astype(int)
-        return float(np.mean(preds == truth))
-
-    def _apply(
-        self,
-        weight_grads: list[np.ndarray],
-        bias_grads: list[np.ndarray],
-        velocities: list[np.ndarray],
-        velocity_b: list[np.ndarray],
-        m_w: list[np.ndarray],
-        v_w: list[np.ndarray],
-        m_b: list[np.ndarray],
-        v_b: list[np.ndarray],
-        step: int,
-    ) -> None:
-        cfg = self.model.config
-        lr = cfg.learning_rate
-
-        for i in range(len(self.model.weights)):
-            gw = weight_grads[i]
-            gb = bias_grads[i]
-
-            # L2 is a weight decay applied to the gradient, not the bias.
-            if cfg.l2 > 0:
-                gw = gw + cfg.l2 * self.model.weights[i]
-
-            if cfg.optimizer == "sgd":
-                self.model.weights[i] -= lr * gw
-                self.model.biases[i] -= lr * gb
-
-            elif cfg.optimizer == "momentum":
-                velocities[i] = cfg.momentum * velocities[i] - lr * gw
-                velocity_b[i] = cfg.momentum * velocity_b[i] - lr * gb
-                self.model.weights[i] += velocities[i]
-                self.model.biases[i] += velocity_b[i]
-
-            else:  # adam
-                m_w[i] = cfg.beta1 * m_w[i] + (1 - cfg.beta1) * gw
-                v_w[i] = cfg.beta2 * v_w[i] + (1 - cfg.beta2) * (gw**2)
-                m_b[i] = cfg.beta1 * m_b[i] + (1 - cfg.beta1) * gb
-                v_b[i] = cfg.beta2 * v_b[i] + (1 - cfg.beta2) * (gb**2)
-
-                m_w_hat = m_w[i] / (1 - cfg.beta1**step)
-                v_w_hat = v_w[i] / (1 - cfg.beta2**step)
-                m_b_hat = m_b[i] / (1 - cfg.beta1**step)
-                v_b_hat = v_b[i] / (1 - cfg.beta2**step)
-
-                self.model.weights[i] -= lr * m_w_hat / (np.sqrt(v_w_hat) + cfg.epsilon)
-                self.model.biases[i] -= lr * m_b_hat / (np.sqrt(v_b_hat) + cfg.epsilon)
-
-
-def validate_loss_for_task(
-    loss: LossName, task: str, output_dim: int
-) -> None:
-    """Refuse a loss that cannot mean anything for this target, instead of coercing it.
-
-    Every rejection here corresponds to a silent-garbage outcome if allowed through.
-    """
-    if task == "regression" and loss != "mse":
-        raise ValueError(
-            f"{loss} cannot be used with a continuous target. Use mse, or change the target column."
-        )
-    if task == "classification" and loss == "mse":
-        raise ValueError(
-            "mse on a class label trains poorly and reports no useful confidence. Use cce or bce."
-        )
-    if loss == "cce" and output_dim < 2:
-        raise ValueError(
-            "cce needs at least two classes. This target has one, so use bce instead."
-        )
-    if loss == "bce" and output_dim > 1:
-        raise ValueError(
-            f"bce expects a single output, but this target has {output_dim} classes. Use cce."
         )
