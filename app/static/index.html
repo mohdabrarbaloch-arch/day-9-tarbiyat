@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tarbiyat — train a neural network you can actually read</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- ── Auth ────────────────────────────────────────────────────────── -->
+<section id="auth-view" class="auth-view">
+  <div class="auth-card">
+    <div class="brand">
+      <span class="brand-mark">تربیت</span>
+      <h1>Tarbiyat</h1>
+      <p class="brand-sub">An ML playground where the gradients are real.</p>
+    </div>
+
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="login" role="tab">Sign in</button>
+      <button class="tab" data-tab="register" role="tab">Create account</button>
+    </div>
+
+    <form id="login-form" class="auth-form">
+      <label>Email<input type="email" name="email" value="demo@tarbiyat.pk" required autocomplete="email" /></label>
+      <label>Password<input type="password" name="password" value="tarbiyat-demo-2026" required autocomplete="current-password" /></label>
+      <button type="submit" class="btn btn-primary">Sign in</button>
+      <p class="hint">The demo account is pre-filled and comes with three datasets.</p>
+    </form>
+
+    <form id="register-form" class="auth-form hidden">
+      <label>Name<input type="text" name="display_name" maxlength="120" autocomplete="name" /></label>
+      <label>Email<input type="email" name="email" required autocomplete="email" /></label>
+      <label>Password<input type="password" name="password" minlength="8" maxlength="72" required autocomplete="new-password" /></label>
+      <button type="submit" class="btn btn-primary">Create account</button>
+      <p class="hint">At least 8 characters, and not all digits.</p>
+    </form>
+
+    <p id="auth-error" class="error hidden"></p>
+  </div>
+</section>
+
+<!-- ── App ─────────────────────────────────────────────────────────── -->
+<div id="app-view" class="app-view hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand-mark small">تربیت</span>
+      <strong>Tarbiyat</strong>
+      <span class="tag" id="api-tag">connected</span>
+    </div>
+    <div class="topbar-right">
+      <span id="user-email" class="muted"></span>
+      <button id="logout" class="btn btn-ghost">Sign out</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Sidebar: datasets -->
+    <aside class="panel datasets-panel">
+      <div class="panel-head">
+        <h2>Datasets</h2>
+        <button id="toggle-upload" class="btn btn-ghost small">+ Upload</button>
+      </div>
+
+      <form id="upload-form" class="upload-form hidden">
+        <label>CSV file<input type="file" name="file" accept=".csv,text/csv" required /></label>
+        <label>Target column<input type="text" name="target" placeholder="e.g. species" required /></label>
+        <label>Name (optional)<input type="text" name="name" placeholder="My dataset" /></label>
+        <button type="submit" class="btn btn-primary small">Upload</button>
+        <p class="hint">Max 20,000 rows. Categorical columns are one-hot encoded for you.</p>
+      </form>
+
+      <ul id="dataset-list" class="dataset-list"></ul>
+    </aside>
+
+    <!-- Main -->
+    <section class="panel work-panel">
+      <div id="empty-state" class="empty">
+        <h2>Pick a dataset to begin</h2>
+        <p class="muted">
+          Choose one on the left, set the layer sizes, and press Train. The model is a
+          hand-written numpy multilayer perceptron — every weight update you see comes
+          from backpropagation written in this repo, not from a framework.
+        </p>
+      </div>
+
+      <div id="work" class="hidden">
+        <div class="work-head">
+          <div>
+            <h2 id="ds-name">—</h2>
+            <p id="ds-meta" class="muted"></p>
+          </div>
+          <span id="ds-task" class="tag"></span>
+        </div>
+
+        <div class="columns">
+          <!-- Config -->
+          <div class="config-col">
+            <h3>Model</h3>
+            <div class="field-row">
+              <label>Layers <span class="hint-inline">comma separated</span>
+                <input id="cfg-layers" type="text" value="16,8" />
+              </label>
+            </div>
+            <div class="grid-2">
+              <label>Activation
+                <select id="cfg-activation">
+                  <option value="relu">relu</option>
+                  <option value="tanh">tanh</option>
+                  <option value="sigmoid">sigmoid</option>
+                </select>
+              </label>
+              <label>Init
+                <select id="cfg-init">
+                  <option value="he">he</option>
+                  <option value="xavier">xavier</option>
+                  <option value="normal">normal</option>
+                </select>
+              </label>
+              <label>Optimizer
+                <select id="cfg-optimizer">
+                  <option value="adam">adam</option>
+                  <option value="momentum">momentum</option>
+                  <option value="sgd">sgd</option>
+                </select>
+              </label>
+              <label>Loss
+                <select id="cfg-loss">
+                  <option value="">auto</option>
+                  <option value="cce">cce</option>
+                  <option value="bce">bce</option>
+                  <option value="mse">mse</option>
+                </select>
+              </label>
+              <label>Learning rate<input id="cfg-lr" type="number" value="0.05" step="0.005" min="0.001" max="2" /></label>
+              <label>Epochs<input id="cfg-epochs" type="number" value="120" step="10" min="1" max="400" /></label>
+              <label>Batch size<input id="cfg-batch" type="number" value="16" step="4" min="1" max="512" /></label>
+              <label>L2<input id="cfg-l2" type="number" value="0" step="0.001" min="0" max="0.5" /></label>
+              <label>Test split<input id="cfg-split" type="number" value="0.2" step="0.05" min="0.05" max="0.5" /></label>
+              <label>Seed<input id="cfg-seed" type="number" value="42" min="0" step="1" /></label>
+            </div>
+            <label class="checkbox">
+              <input id="cfg-early" type="checkbox" /> Early stopping on validation loss
+            </label>
+            <button id="train-btn" class="btn btn-primary">Train model</button>
+            <p id="train-error" class="error hidden"></p>
+          </div>
+
+          <!-- Results -->
+          <div class="results-col">
+            <div class="chart-head">
+              <h3>Loss</h3>
+              <div class="legend">
+                <span class="legend-dot train"></span> train
+                <span class="legend-dot val"></span> validation
+              </div>
+            </div>
+            <canvas id="loss-chart" width="720" height="260"></canvas>
+
+            <div id="metrics" class="metrics hidden"></div>
+            <div id="confusion" class="confusion hidden"></div>
+
+            <div id="predict-box" class="predict hidden">
+              <h3>Score a new row</h3>
+              <div id="predict-fields" class="grid-2"></div>
+              <button id="predict-btn" class="btn btn-ghost small">Predict</button>
+              <div id="predict-out" class="predict-out"></div>
+            </div>
+
+            <div id="run-log" class="run-log"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
