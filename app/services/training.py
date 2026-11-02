@@ -1,10 +1,9 @@
 """Training orchestration: dataset → split → fit → evaluate → persist.
 
-The important boundaries here:
-  * a loss that cannot mean anything for the target is refused, not coerced;
-  * the metrics always include a naive baseline, because 80% accuracy on a dataset
-    that is 80% one class means the model learned nothing;
-  * the encoding is persisted with the weights so prediction cannot drift.
+The important design decision in this file is the loss resolver. A classification head
+cannot be scored with MSE and come out meaningful, and a regression target cannot be
+trained with cross-entropy. Rather than quietly substituting one for the other and
+reporting a number that looks fine, `resolve_loss` refuses the combination and says why.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.ml.dataset import (
     DatasetError,
+    EncodedDataset,
     EncodingSpec,
     confusion_matrix,
     encode,
@@ -27,243 +27,227 @@ from app.ml.dataset import (
     per_class_metrics,
     stratified_split,
 )
-from app.ml.nn import MLP, LossName, TrainConfig, Trainer, validate_loss_for_task
+from app.ml.nn import MLP, LossName, TrainConfig, Trainer, validate_loss_for_output
 from app.models import Dataset, TrainingRun, User
 
 
 class TrainingError(Exception):
-    """A configuration or data problem the user can fix, phrased for them."""
+    """A run could not be completed for a reason the user can act on."""
 
 
 @dataclass
-class TrainOutcome:
+class RunOutcome:
     run: TrainingRun
-    metrics: dict
+    test_predictions: np.ndarray
+    test_truth: np.ndarray
 
 
-def _choose_loss(task: str, output_dim: int, requested: str | None) -> LossName:
-    """Pick the only sensible loss, then check the request against it."""
+def resolve_loss(task: str, output_dim: int, requested: LossName | None) -> LossName:
+    """Pick a loss that is actually valid for this head, or refuse."""
+    if requested is not None:
+        validate_loss_for_output(requested, output_dim)
+        if task == "regression" and requested != "mse":
+            raise TrainingError(
+                f"'{requested}' is a classification loss but this dataset has a continuous "
+                "target. Use mse, or pick a target column with few distinct values."
+            )
+        if task == "classification" and requested == "mse":
+            raise TrainingError(
+                "mse on a classification head produces a number that looks like a loss but "
+                "means nothing for accuracy. Use cce for multi-class, bce for two classes."
+            )
+        return requested
+
     if task == "regression":
-        natural: LossName = "mse"
-    elif output_dim == 2:
-        natural = "bce"
-    else:
-        natural = "cce"
-
-    if requested is None:
-        return natural
-
-    loss = requested  # type: ignore[assignment]
-    validate_loss_for_task(loss, task, output_dim)
-    return loss
-
-
-def _build_config(raw: dict, settings: Settings) -> TrainConfig:
-    """Clamp the request against the deployment's ceilings, then construct the config."""
-    hidden = list(raw.get("hidden_layers") or [16])
-    if len(hidden) > settings.max_hidden_layers:
-        raise TrainingError(
-            f"At most {settings.max_hidden_layers} hidden layers are allowed (you asked for {len(hidden)})."
-        )
-    if any(width > settings.max_layer_width or width < 1 for width in hidden):
-        raise TrainingError(
-            f"Every hidden layer must be between 1 and {settings.max_layer_width} units wide."
-        )
-
-    epochs = int(raw.get("epochs", 120))
-    if epochs > settings.max_epochs:
-        raise TrainingError(
-            f"At most {settings.max_epochs} epochs are allowed on this deployment (you asked for {epochs})."
-        )
-
-    return TrainConfig(
-        hidden_layers=hidden,
-        activation=raw.get("activation", "relu"),
-        init=raw.get("init", "he"),
-        learning_rate=float(raw.get("learning_rate", 0.05)),
-        epochs=epochs,
-        batch_size=int(raw.get("batch_size", 16)),
-        l2=float(raw.get("l2", 0.0)),
-        early_stopping=bool(raw.get("early_stopping", False)),
-        patience=int(raw.get("patience", 12)),
-        seed=int(raw.get("seed", 42)),
-    )
+        return "mse"
+    return "bce" if output_dim == 1 else "cce"
 
 
 def _weights_to_json(weights: list[np.ndarray], biases: list[np.ndarray]) -> str:
     return json.dumps(
         {
-            "weights": [np.round(w, 6).tolist() for w in weights],
-            "biases": [np.round(b, 6).tolist() for b in biases],
+            "weights": [w.tolist() for w in weights],
+            "biases": [b.tolist() for b in biases],
         }
     )
 
 
-def load_weights(blob: str) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    parsed = json.loads(blob)
-    weights = [np.array(w, dtype=np.float64) for w in parsed["weights"]]
-    biases = [np.array(b, dtype=np.float64) for b in parsed["biases"]]
+def load_weights(payload: str) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    blob = json.loads(payload)
+    weights = [np.array(w, dtype=np.float64) for w in blob["weights"]]
+    biases = [np.array(b, dtype=np.float64) for b in blob["biases"]]
     return weights, biases
+
+
+def run_output_dim(run: TrainingRun) -> int:
+    """Recover the output width a finished run was trained with."""
+    weights, _ = load_weights(run.weights_json or '{"weights": [], "biases": []}')
+    if not weights:
+        raise TrainingError("This run has no stored weights to predict with.")
+    return int(weights[-1].shape[1])
+
+
+def _rebuild_encoded(dataset: Dataset) -> EncodedDataset:
+    """Re-derive the encoded matrices from the stored CSV. Single source of truth."""
+    parsed = parse_csv(
+        dataset.csv_body.encode("utf-8"),
+        target=dataset.target,
+        max_rows=20_000,
+        max_columns=60,
+    )
+    return encode(parsed)
 
 
 def run_training(
     session: Session,
     user: User,
     dataset: Dataset,
-    raw_config: dict,
+    request_config: dict,
     settings: Settings,
-) -> TrainOutcome:
-    """Train one model and persist everything needed to score with it later."""
-    started = time.monotonic()
+) -> RunOutcome:
+    """Train synchronously and persist the result. Raises TrainingError on bad input."""
+    started = time.perf_counter()
 
-    parsed = parse_csv(
-        dataset.csv_body.encode("utf-8"),
-        dataset.target,
-        max_rows=settings.max_dataset_rows,
-        max_columns=settings.max_dataset_columns,
-    )
-    encoded = encode(parsed)
-
-    loss = _choose_loss(parsed.task, encoded.output_dim, raw_config.get("loss"))
-    config = _build_config(raw_config, settings)
-    rng = np.random.default_rng(config.seed)
-
-    x_train, y_train, x_test, y_test = stratified_split(
-        encoded.x, encoded.y, float(raw_config.get("test_fraction", 0.2)), rng
-    )
+    encoded = _rebuild_encoded(dataset)
 
     output_dim = encoded.output_dim
+    loss = resolve_loss(encoded.task, output_dim, request_config.get("loss"))
+
+    cfg = TrainConfig(
+        hidden_layers=list(request_config["hidden_layers"]),
+        activation=request_config["activation"],
+        init=request_config["init"],
+        optimizer=request_config["optimizer"],
+        learning_rate=float(request_config["learning_rate"]),
+        epochs=int(request_config["epochs"]),
+        batch_size=int(request_config["batch_size"]),
+        l2=float(request_config["l2"]),
+        seed=int(request_config["seed"]),
+    )
+
+    if cfg.epochs > settings.max_epochs:
+        raise TrainingError(f"epochs is capped at {settings.max_epochs} on this deployment.")
+    if len(cfg.hidden_layers) > settings.max_hidden_layers:
+        raise TrainingError(f"At most {settings.max_hidden_layers} hidden layers are allowed here.")
+
+    rng = np.random.default_rng(cfg.seed)
+    test_fraction = float(request_config.get("test_fraction", 0.2))
+
+    try:
+        train_idx, test_idx = stratified_split(encoded.y, test_fraction, rng)
+    except ValueError as exc:
+        raise TrainingError(str(exc)) from exc
+
+    if train_idx.size == 0:
+        raise DatasetError("The split produced no training rows.")
+
+    x_train, y_train = encoded.x[train_idx], encoded.y[train_idx]
+
+    # Carve a validation slice out of training when early stopping is requested.
+    early_stopping = bool(request_config.get("early_stopping"))
+    x_val = y_val = None
+    if early_stopping and train_idx.size >= 20:
+        n_val = max(4, int(round(train_idx.size * 0.15)))
+        val_idx = train_idx[-n_val:]
+        fit_idx = train_idx[:-n_val]
+        x_train, y_train = encoded.x[fit_idx], encoded.y[fit_idx]
+        x_val, y_val = encoded.x[val_idx], encoded.y[val_idx]
+
     model = MLP(
         input_dim=encoded.x.shape[1],
         output_dim=output_dim,
-        config=config,
+        config=cfg,
         rng=rng,
         linear_head=encoded.task == "regression",
     )
     trainer = Trainer(model, loss, rng)
 
+    result = trainer.fit(
+        x_train,
+        y_train,
+        x_val=x_val,
+        y_val=y_val,
+        patience=int(request_config.get("patience", 12)) if early_stopping else None,
+    )
+
+    x_test, y_test = encoded.x[test_idx], encoded.y[test_idx]
+
+    if encoded.task == "classification":
+        test_pred = model.predict(x_test)
+        test_truth = np.argmax(y_test, axis=1)
+        accuracy = float(np.mean(test_pred == test_truth)) if test_truth.size else 0.0
+        metrics: dict = {
+            "task": "classification",
+            "accuracy": round(accuracy, 4),
+            "test_rows": int(test_truth.size),
+            "confusion_matrix": confusion_matrix(test_pred, test_truth, output_dim),
+            "per_class": per_class_metrics(test_pred, test_truth, encoded.output_labels),
+            "labels": encoded.output_labels,
+            "loss": loss,
+            "best_epoch": result.best_epoch,
+            "stopped_early": result.stopped_early,
+            "final_train_loss": round(result.final_train_loss, 6),
+            "final_val_loss": (
+                round(result.final_val_loss, 6) if result.final_val_loss is not None else None
+            ),
+        }
+        # A majority-class baseline makes the accuracy number interpretable.
+        counts = np.bincount(test_truth, minlength=output_dim)
+        metrics["majority_baseline"] = (
+            round(float(counts.max() / test_truth.size), 4) if test_truth.size else 0.0
+        )
+    else:
+        pred_std = model.predict_proba(x_test)[:, 0]
+        pred_raw = pred_std * encoded.target_std + encoded.target_mean
+        truth_raw = y_test[:, 0] * encoded.target_std + encoded.target_mean
+        resid = pred_raw - truth_raw
+        ss_res = float(np.sum(resid**2))
+        ss_tot = float(np.sum((truth_raw - truth_raw.mean()) ** 2)) or 1.0
+        metrics = {
+            "task": "regression",
+            "rmse": round(float(np.sqrt(np.mean(resid**2))), 4),
+            "mae": round(float(np.mean(np.abs(resid))), 4),
+            "r2": round(1.0 - ss_res / ss_tot, 4),
+            "test_rows": int(truth_raw.size),
+            "target_mean": round(encoded.target_mean, 4),
+            "target_std": round(encoded.target_std, 4),
+            "loss": loss,
+            "best_epoch": result.best_epoch,
+            "stopped_early": result.stopped_early,
+            "final_train_loss": round(result.final_train_loss, 6),
+            "final_val_loss": (
+                round(result.final_val_loss, 6) if result.final_val_loss is not None else None
+            ),
+            # A constant predictor's RMSE — if the model cannot beat this, it learned nothing.
+            "baseline_rmse": round(float(np.std(truth_raw)), 4),
+        }
+        test_pred = pred_raw
+        test_truth = truth_raw
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
     run = TrainingRun(
         owner_id=user.id,
         dataset_id=dataset.id,
-        label=(raw_config.get("label") or "").strip()[:200],
-        status="running",
-        config_json=json.dumps({**raw_config, "resolved_loss": loss}),
+        label=request_config.get("label") or f"{dataset.name} · {cfg.optimizer}",
+        status="completed",
+        config_json=json.dumps(cfg.as_dict()),
         loss=loss,
-        test_fraction=float(raw_config.get("test_fraction", 0.2)),
-        param_count=model.param_count,
+        test_fraction=test_fraction,
+        history_json=json.dumps([h.__dict__ for h in result.history]),
+        metrics_json=json.dumps(metrics),
+        weights_json=_weights_to_json(result.weights, result.biases),
+        encoding_json=json.dumps(encoded.spec.as_dict()) if encoded.spec else None,
+        param_count=model.param_count(),
         train_rows=int(x_train.shape[0]),
-        test_rows=int(x_test.shape[0]),
+        test_rows=int(test_idx.size),
+        duration_ms=duration_ms,
     )
     session.add(run)
-    session.flush()  # assign the id without committing a half-written row
-
-    try:
-        result = trainer.fit(x_train, y_train, x_test, y_test)
-    except MemoryError as exc:  # pragma: no cover - depends on the host
-        run.status = "failed"
-        run.error = "Ran out of memory during training."
-        session.commit()
-        raise TrainingError(run.error) from exc
-
-    metrics = _evaluate(model, x_test, y_test, encoded, loss)
-    metrics["task"] = encoded.task
-    metrics["epochs_run"] = len(result.history)
-    metrics["stopped_early"] = result.stopped_early
-    metrics["best_epoch"] = result.best_epoch
-    metrics["duration_ms"] = int((time.monotonic() - started) * 1000)
-    metrics["input_dim"] = int(encoded.x.shape[1])
-
-    run.status = "completed"
-    run.history_json = json.dumps(
-        [
-            {
-                "epoch": s.epoch,
-                "train_loss": s.train_loss,
-                "train_accuracy": s.train_accuracy,
-                "val_loss": s.val_loss,
-                "val_accuracy": s.val_accuracy,
-            }
-            for s in result.history
-        ]
-    )
-    run.metrics_json = json.dumps(metrics)
-    run.weights_json = _weights_to_json(result.weights, result.biases)
-    run.encoding_json = json.dumps(encoded.spec.as_dict()) if encoded.spec else None
-    run.duration_ms = int((time.monotonic() - started) * 1000)
-    from datetime import UTC, datetime
-
-    run.finished_at = datetime.now(UTC)
     session.commit()
     session.refresh(run)
-    return TrainOutcome(run=run, metrics=metrics)
 
-
-def _evaluate(
-    model: MLP, x_test: np.ndarray, y_test: np.ndarray, encoded, loss: LossName
-) -> dict:
-    """Score on the held-out split, always next to a naive baseline."""
-    out: dict = {"loss": round(model.loss(x_test, y_test, loss), 6)}
-
-    if encoded.task == "classification":
-        proba = model.predict_proba(x_test)
-        truth = np.argmax(y_test, axis=1)
-
-        if proba.shape[1] == 1:
-            preds = (proba[:, 0] >= 0.5).astype(int)
-            truth_idx = (y_test[:, 0] >= 0.5).astype(int)
-            accuracy = float(np.mean(preds == truth_idx))
-            # Baseline: always predict the majority class.
-            majority = float(np.bincount(truth_idx).max() / len(truth_idx))
-            out.update(
-                {
-                    "accuracy": round(accuracy, 4),
-                    "majority_baseline": round(majority, 4),
-                    "labels": encoded.output_labels,
-                    "confusion_matrix": confusion_matrix(
-                        truth_idx, preds, 2
-                    ),
-                    "per_class": per_class_metrics(
-                        truth_idx, preds, encoded.output_labels
-                    ),
-                }
-            )
-        else:
-            preds = np.argmax(proba, axis=1)
-            accuracy = float(np.mean(preds == truth))
-            majority = float(np.bincount(truth, minlength=proba.shape[1]).max() / len(truth))
-            out.update(
-                {
-                    "accuracy": round(accuracy, 4),
-                    "majority_baseline": round(majority, 4),
-                    "labels": encoded.output_labels,
-                    "confusion_matrix": confusion_matrix(truth, preds, proba.shape[1]),
-                    "per_class": per_class_metrics(truth, preds, encoded.output_labels),
-                }
-            )
-        return out
-
-    # Regression
-    preds = model.predict_proba(x_test)[:, 0] * encoded.target_std + encoded.target_mean
-    truth_raw = y_test[:, 0] * encoded.target_std + encoded.target_mean
-    residual = truth_raw - preds
-    ss_res = float(np.sum(residual**2))
-    ss_tot = float(np.sum((truth_raw - truth_raw.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    rmse = float(np.sqrt(np.mean(residual**2)))
-    # Baseline: always predict the training mean. An RMSE above this is worse than
-    # refusing to model at all, which is worth seeing explicitly.
-    baseline_rmse = float(np.sqrt(np.mean((truth_raw - truth_raw.mean()) ** 2)))
-    out.update(
-        {
-            "r2": round(r2, 4),
-            "rmse": round(rmse, 4),
-            "mae": round(float(np.mean(np.abs(residual))), 4),
-            "mean_baseline_rmse": round(baseline_rmse, 4),
-            "target_mean": round(encoded.target_mean, 4),
-            "target_std": round(encoded.target_std, 4),
-        }
-    )
-    return out
+    return RunOutcome(run=run, test_predictions=test_pred, test_truth=test_truth)
 
 
 def predict_rows(
@@ -312,9 +296,7 @@ def predict_rows(
         linear_head=spec.task == "regression",
     )
     if [w.shape for w in model.weights] != [w.shape for w in weights]:
-        raise TrainingError(
-            "The stored weights do not match the stored encoding. Re-run training."
-        )
+        raise TrainingError("The stored weights do not match the stored encoding. Re-run training.")
     model.weights = weights
     model.biases = biases
 
@@ -331,8 +313,7 @@ def predict_rows(
                     "predicted": label,
                     "confidence": round(float(proba[i, int(p)]), 4),
                     "probabilities": {
-                        lbl: round(float(proba[i, j]), 4)
-                        for j, lbl in enumerate(spec.labels)
+                        lbl: round(float(proba[i, j]), 4) for j, lbl in enumerate(spec.labels)
                     },
                 }
             )
